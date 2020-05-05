@@ -347,13 +347,13 @@ class GAN(nn.Module):
                           .format(epoch, num_epochs, i+1, total_step, d_losses[epoch], g_losses[epoch], 
                                   real_scores[epoch], fake_scores[epoch]))
 
-            if epoch == num_epochs - 1:
+            if epoch > 0 and (epoch % 10 == 0 or epoch == num_epochs - 1):
                 #Save sampled images
                 self.compute_inception_fid()
-                sample = self.G(test_z)
-                #sample = sample.view(sample.size(0), 3, 28, 28)
-                #save_image(self.denorm(sample), path + '/image_{}.png'.format(epoch+1))
-                save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(epoch+1))
+#                 sample = self.G(test_z)
+#                 #sample = sample.view(sample.size(0), 3, 28, 28)
+#                 #save_image(self.denorm(sample), path + '/image_{}.png'.format(epoch+1))
+#                 save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(epoch+1))
                 
                 
         # Save the model checkpoints 
