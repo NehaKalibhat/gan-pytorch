@@ -169,8 +169,8 @@ class GAN(nn.Module):
         masks = {}
         for name in vae_init:
             gan_layer = None
-#             if 'encoder.' in name and '9' not in name and '10' not in name and '12' not in name and '13' not in name:
-#                 gan_layer = name.replace('encoder', 'D.module')
+            if 'encoder.' in name and '9' not in name and '10' not in name and '12' not in name and '13' not in name:
+                gan_layer = name.replace('encoder', 'D.module')
             if 'decoder.' in name and '4' in name:
                 gan_layer = name.replace('decoder', 'G.module')
                 gan_layer = gan_layer.replace('4', '1')
@@ -498,17 +498,17 @@ if __name__ == "__main__":
     #model.one_shot_prune(80, trained_original_model_state = trained_original_model_state)
     #model.train(prune = False, init_state = init_state, init_with_old = init_with_old)
     
-#     for i in range(20):
-#         model = GAN(hidden_size = hidden_size, latent_size = latent_size).to(device)
-#         model.load_vae(vae_init_path = '../vae-pytorch/celeba/before_train.pth', vae_trained_path = '../vae-pytorch/celeba_iter_1/end_of_'+str(i)+'.pth')
-#         model.train(prune = True, init_with_old = False)
-#         sample = model.G(test_z)
-#         save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(i))
+    for i in range(20):
+        model = GAN(hidden_size = hidden_size, latent_size = latent_size).to(device)
+        model.load_vae(vae_init_path = '../vae-pytorch/celeba/before_train.pth', vae_trained_path = '../vae-pytorch/celeba_iter_1/end_of_'+str(i)+'.pth')
+        model.train(prune = True, init_with_old = False)
+        sample = model.G(test_z)
+        save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(i))
 
-    model.iterative_prune(init_state = init_state, 
-                        trained_original_model_state = trained_original_model_state, 
-                        number_of_iterations = 20, 
-                        percent = 20, 
-                        init_with_old = init_with_old,
-                        prune_gen = prune_gen,
-                        prune_disc = prune_disc)
+#     model.iterative_prune(init_state = init_state, 
+#                         trained_original_model_state = trained_original_model_state, 
+#                         number_of_iterations = 20, 
+#                         percent = 20, 
+#                         init_with_old = init_with_old,
+#                         prune_gen = prune_gen,
+#                         prune_disc = prune_disc)

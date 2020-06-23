@@ -18,6 +18,8 @@ from torch.distributions import kl_divergence
 import inception_tf
 import fid
 import os.path as osp
+import types
+import pickle
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 learning_rate = 0.0002
@@ -75,8 +77,8 @@ class GAN(nn.Module):
         # Device setting
         self.D = self.D.to(device)
         self.G = self.G.to(device)
-        self.G = nn.DataParallel(self.G)
-        self.D = nn.DataParallel(self.D)
+#         self.G = nn.DataParallel(self.G)
+#         self.D = nn.DataParallel(self.D)
 
         self.best_is = 0
         self.best_fid = 0
@@ -149,16 +151,12 @@ class GAN(nn.Module):
         model_state = torch.load(model_path)
         new_state = {}
         for name in model_state['gan']:
-            if ("G" in name and "0" not in name and prune_gen) or ("D" in name and "9" not in name and prune_disc):
+            if "mask" not in name:
                 self.log(f"loading {name}")
                 new_state[name] = model_state['gan'][name]
-            else:
-                new_state[name] = self.state_dict()[name]
         self.load_state_dict(new_state)
-        if prune_gen:
-            self.g_optimizer.load_state_dict(model_state['g_optimizer'])
-        if prune_disc:
-            self.d_optimizer.load_state_dict(model_state['d_optimizer'])
+        self.g_optimizer.load_state_dict(model_state['g_optimizer'])
+        self.d_optimizer.load_state_dict(model_state['d_optimizer'])
     
     def load_vae(self, vae_init_path, vae_trained_path):
         vae_init = torch.load(vae_init_path)['vae']
@@ -202,6 +200,164 @@ class GAN(nn.Module):
         self.log(f"Fraction of weights pruned = {zeros}/{total} = {zeros/total}")
         self.masks = masks       
         
+        
+    def SNIP(self, keep_ratio):
+        # TODO: shuffle?
+
+        def snip_forward_conv2d(self, x):
+            return F.conv2d(x, self.weight * self.weight_mask, self.bias,
+                        self.stride, self.padding, self.dilation, self.groups)
+
+        def snip_forward_convTranspose2d(self, x):
+            return F.conv_transpose2d(x, self.weight * self.weight_mask, self.bias,
+                            self.stride, self.padding, self.output_padding, self.groups, self.dilation)
+    
+
+        # Grab a single batch from the training dataset
+        inputs, targets = next(iter(dataloader))
+        
+        # Monkey-patch the Linear and Conv2d layer to learn the multiplicative mask
+        # instead of the weights
+        for layer in self.modules():
+            if isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d)):
+                layer.weight_mask = nn.Parameter(torch.ones_like(layer.weight))
+                layer.weight.requires_grad = False
+                if isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d)):
+                    nn.init.xavier_normal_(layer.weight)
+                
+            # Override the forward methods:
+            if isinstance(layer, nn.Conv2d):
+                layer.forward = types.MethodType(snip_forward_conv2d, layer)
+            elif isinstance(layer, nn.ConvTranspose2d):
+                layer.forward = types.MethodType(snip_forward_convTranspose2d, layer)
+            
+        # Compute gradients (but don't apply them)
+        
+        mini_batch = inputs.size()[0]
+        images = inputs.to(device)
+        # Create the labels which are later used as input for the BCE loss
+        real_labels = torch.ones(mini_batch).to(device)
+        fake_labels = torch.zeros(mini_batch).to(device)
+
+        # ================================================================== #
+        #                      Train the discriminator                       #
+        # ================================================================== #
+
+        # Compute BCE_Loss using real images where BCE_Loss(x, y): - y * log(D(x)) - (1-y) * log(1 - D(x))
+        # Second term of the loss is always zero since real_labels == 1
+        outputs = self.D(images).squeeze()
+        d_loss_real = self.criterion(outputs, real_labels)
+        real_score = outputs
+
+        # Compute BCELoss using fake images
+        # First term of the loss is always zero since fake_labels == 0
+        z = torch.randn(mini_batch, latent_size, 1, 1).to(device)
+        fake_images = self.G(z)
+        outputs = self.D(fake_images).squeeze()
+        d_loss_fake = self.criterion(outputs, fake_labels)
+        fake_score = outputs
+
+        # Backprop and optimize
+        d_loss = d_loss_real + d_loss_fake
+        d_loss.backward()
+        
+        # ================================================================== #
+        #                        Train the generator                         #
+        # ================================================================== #
+
+        # Compute loss with fake images
+        z = torch.randn(mini_batch, latent_size, 1, 1).to(device)
+        fake_images = self.G(z)
+        outputs = self.D(fake_images).squeeze()
+
+        # We train G to maximize log(D(G(z)) instead of minimizing log(1-D(G(z)))
+        # For the reason, see the last paragraph of section 3. https://arxiv.org/pdf/1406.2661.pdf
+        g_loss = self.criterion(outputs, real_labels)
+
+        # Backprop and optimize
+        g_loss.backward()        
+                
+
+        grads_abs = []
+        for layer in self.modules():
+            if isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d)):
+                print(layer, layer.weight_mask.grad.shape)
+                grads_abs.append(torch.abs(layer.weight_mask.grad))
+
+        # Gather all scores in a single vector and normalise
+        all_scores = torch.cat([torch.flatten(x) for x in grads_abs])
+        norm_factor = torch.sum(all_scores)
+        all_scores.div_(norm_factor)
+
+        print(len(all_scores))
+        num_params_to_keep = int(len(all_scores) * keep_ratio)
+        threshold, _ = torch.topk(all_scores, num_params_to_keep, sorted=True)
+        acceptable_score = threshold[-1]
+
+        keep_masks = []
+        for g in grads_abs:
+            keep_masks.append(((g / norm_factor) >= acceptable_score).float())
+
+        print(torch.sum(torch.cat([torch.flatten(x == 1) for x in keep_masks])))
+
+        return(keep_masks)
+    
+    
+    def apply_prune_mask(self, keep_masks):
+
+        # Before I can zip() layers and pruning masks I need to make sure they match
+        # one-to-one by removing all the irrelevant modules:
+        prunable_layers = filter(
+            lambda layer: isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d)), self.modules())
+
+        for layer, keep_mask in zip(prunable_layers, keep_masks):
+            assert (layer.weight.shape == keep_mask.shape)
+            
+            def hook_factory(keep_mask):
+                """
+                The hook function can't be defined directly here because of Python's
+                late binding which would result in all hooks getting the very last
+                mask! Getting it through another function forces early binding.
+                """
+
+                def hook(grads):
+                    return grads * keep_mask
+
+                return hook
+
+            # mask[i] == 0 --> Prune parameter
+            # mask[i] == 1 --> Keep parameter
+
+            # Step 1: Set the masked weights to zero (NB the biases are ignored)
+            # Step 2: Make sure their gradients remain zero
+            layer.weight.data[keep_mask == 0.] = 0.
+            layer.weight.requires_grad = True
+            layer.weight.register_hook(hook_factory(keep_mask))
+
+
+    def do_snip(self, init_with_old, keep_ratio):
+#         self.train(num_epochs = 5)
+        
+        masks = self.SNIP(keep_ratio)
+        
+        self.save(path + "/model_state_" + str(keep_ratio) + ".pth")
+        with open(path + "/masks_" + str(keep_ratio), "wb") as f:
+            pickle.dump(masks, f)
+        
+    def train_snip(self, init_with_old, keep_ratio):
+        with open(path + "/masks_" + str(keep_ratio), "rb") as f:
+            masks = pickle.load(f)
+            
+        if init_with_old:
+            self.load(path + "/model_state_" + str(keep_ratio) + ".pth")
+            
+        self.apply_prune_mask(masks)
+
+        self.train(num_epochs = num_epochs)
+        sample = self.G(test_z)
+        save_image(sample * 0.5 + 0.5, path + '/image_' + str(keep_ratio) + '.png')
+
+
         
     def one_shot_prune(self, pruning_perc, prune_gen = True, prune_disc = True, layer_wise = False, trained_original_model_state = None):
         self.log(f"************pruning {pruning_perc} of the network****************")
@@ -307,15 +463,8 @@ class GAN(nn.Module):
             out = (x + 1) / 2
             return out.clamp(0, 1)
 
-    def train(self, prune, init_state = None, init_with_old = True, prune_gen = True, prune_disc = True):
+    def train(self, num_epochs):
         self.log(f"Number of parameters in model {sum(p.numel() for p in self.parameters())}")
-        if not prune:
-            self.save(path + '/before_train.pth')
-        
-        if prune and init_with_old:
-            self.load(init_state, 
-                      prune_gen = prune_gen,
-                      prune_disc = prune_disc)
         
         d_losses = np.zeros(num_epochs)
         g_losses = np.zeros(num_epochs)
@@ -358,10 +507,6 @@ class GAN(nn.Module):
                 d_loss.backward()
                 self.d_optimizer.step()
                 
-                if prune:
-                    self.mask(prune_gen = prune_gen,
-                              prune_disc = prune_disc)
-
                 # ================================================================== #
                 #                        Train the generator                         #
                 # ================================================================== #
@@ -379,10 +524,6 @@ class GAN(nn.Module):
                 self.reset_grad()
                 g_loss.backward()
                 self.g_optimizer.step()
-                
-                if prune:
-                    self.mask(prune_gen = prune_gen,
-                              prune_disc = prune_disc)
                     
                 d_losses[epoch] = d_losses[epoch]*(i/(i+1.)) + d_loss.item()*(1./(i+1.))
                 g_losses[epoch] = g_losses[epoch]*(i/(i+1.)) + g_loss.item()*(1./(i+1.))
@@ -396,10 +537,8 @@ class GAN(nn.Module):
             if epoch == num_epochs - 1:
                 #Save sampled images
                 self.compute_inception_fid()
-                #sample = self.G(test_z)
-                #sample = sample.view(sample.size(0), 3, 28, 28)
-                #save_image(self.denorm(sample), path + '/image_{}.png'.format(epoch+1))
-                #save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(epoch+1))
+#                 sample = self.G(test_z)
+#                 save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(epoch+1))
                 
                 
         # Save the model checkpoints 
@@ -422,7 +561,8 @@ if __name__ == "__main__":
     parser.add_argument('--init_with_old', default='True', type=str)
     parser.add_argument('--prune_gen', default='True', type=str)
     parser.add_argument('--prune_disc', default='True', type=str)
-
+    parser.add_argument('--keep_ratio', default=0.2, type=float)
+    
     args = parser.parse_args()
 
     if args.num_epochs != '':
@@ -467,6 +607,10 @@ if __name__ == "__main__":
     if args.prune_disc != '':
          prune_disc = args.prune_disc == 'True'
 
+    if args.keep_ratio != '':
+         keep_ratio = args.keep_ratio
+
+    
     img_transform = transforms.Compose([
                 transforms.Resize(image_size),
                 transforms.RandomCrop(image_size),
@@ -505,10 +649,13 @@ if __name__ == "__main__":
 #         sample = model.G(test_z)
 #         save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(i))
 
-    model.iterative_prune(init_state = init_state, 
-                        trained_original_model_state = trained_original_model_state, 
-                        number_of_iterations = 20, 
-                        percent = 20, 
-                        init_with_old = init_with_old,
-                        prune_gen = prune_gen,
-                        prune_disc = prune_disc)
+#     model.iterative_prune(init_state = init_state, 
+#                         trained_original_model_state = trained_original_model_state, 
+#                         number_of_iterations = 20, 
+#                         percent = 20, 
+#                         init_with_old = init_with_old,
+#                         prune_gen = prune_gen,
+#                         prune_disc = prune_disc)
+
+#     model.do_snip(init_with_old, keep_ratio)
+    model.train_snip(init_with_old, keep_ratio)

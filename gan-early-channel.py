@@ -18,10 +18,82 @@ from torch.distributions import kl_divergence
 import inception_tf
 import fid
 import os.path as osp
+from compute_flops import print_model_param_nums, print_model_param_flops
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 learning_rate = 0.0002
 
+class EarlyBird():
+    def __init__(self, percent, epoch_keep=5):
+        self.percent = percent
+        self.epoch_keep = epoch_keep
+        self.masks = []
+        self.dists = [1 for i in range(1, self.epoch_keep)]
+
+    def pruning(self, model, percent):
+        total = 0
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                total += m.weight.data.shape[0]
+
+        bn = torch.zeros(total)
+        index = 0
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                size = m.weight.data.shape[0]
+                bn[index:(index+size)] = m.weight.data.abs().clone()
+                index += size
+
+        y, i = torch.sort(bn)
+        thre_index = int(total * percent)
+        thre = y[thre_index]
+        # print('Pruning threshold: {}'.format(thre))
+
+        mask = torch.zeros(total)
+        index = 0
+        for k, m in enumerate(model.modules()):
+            if isinstance(m, nn.BatchNorm2d):
+                size = m.weight.data.numel()
+                weight_copy = m.weight.data.abs().clone()
+                _mask = weight_copy.gt(thre.cuda()).float().cuda()
+                mask[index:(index+size)] = _mask.view(-1)
+                # print('layer index: {:d} \t total channel: {:d} \t remaining channel: {:d}'.format(k, _mask.shape[0], int(torch.sum(_mask))))
+                index += size
+
+        # print('Pre-processing Successful!')
+        return mask
+
+    def put(self, mask):
+        if len(self.masks) < self.epoch_keep:
+            self.masks.append(mask)
+        else:
+            self.masks.pop(0)
+            self.masks.append(mask)
+
+    def cal_dist(self):
+        if len(self.masks) == self.epoch_keep:
+            for i in range(len(self.masks)-1):
+                mask_i = self.masks[-1]
+                mask_j = self.masks[i]
+                self.dists[i] = 1 - float(torch.sum(mask_i==mask_j)) / mask_j.size(0)
+            return True
+        else:
+            return False
+
+    def early_bird_emerge(self, model):
+        mask = self.pruning(model, self.percent)
+        self.put(mask)
+        flag = self.cal_dist()
+        if flag == True:
+            print(self.dists)
+            for i in range(len(self.dists)):
+                if self.dists[i] > 1:
+                    return False
+            return True
+        else:
+            return False
+        
+        
 class GAN(nn.Module):
     def __init__(self, hidden_size, latent_size, input_channels = 3):
         super(GAN, self).__init__()
@@ -75,9 +147,7 @@ class GAN(nn.Module):
         # Device setting
         self.D = self.D.to(device)
         self.G = self.G.to(device)
-        self.G = nn.DataParallel(self.G)
-        self.D = nn.DataParallel(self.D)
-
+        
         self.best_is = 0
         self.best_fid = 0
         
@@ -143,100 +213,6 @@ class GAN(nn.Module):
         model_state['g_optimizer'] = self.g_optimizer.state_dict()
         model_state['d_optimizer'] = self.d_optimizer.state_dict()
         torch.save(model_state, model_path)
-        
-    def load(self, model_path, prune_gen = True, prune_disc = True):
-        self.log(f'Loading saved GAN named {model_path}')
-        model_state = torch.load(model_path)
-        new_state = {}
-        for name in model_state['gan']:
-            if ("G" in name and "0" not in name and prune_gen) or ("D" in name and "9" not in name and prune_disc):
-                self.log(f"loading {name}")
-                new_state[name] = model_state['gan'][name]
-            else:
-                new_state[name] = self.state_dict()[name]
-        self.load_state_dict(new_state)
-        if prune_gen:
-            self.g_optimizer.load_state_dict(model_state['g_optimizer'])
-        if prune_disc:
-            self.d_optimizer.load_state_dict(model_state['d_optimizer'])
-    
-    def load_vae(self, vae_init_path, vae_trained_path):
-        vae_init = torch.load(vae_init_path)['vae']
-        vae_trained = torch.load(vae_trained_path)
-        model = self.state_dict()
-        zeros = 0
-        total = 0
-        masks = {}
-        for name in vae_init:
-            gan_layer = None
-#             if 'encoder.' in name and '9' not in name and '10' not in name and '12' not in name and '13' not in name:
-#                 gan_layer = name.replace('encoder', 'D.module')
-            if 'decoder.' in name and '4' in name:
-                gan_layer = name.replace('decoder', 'G.module')
-                gan_layer = gan_layer.replace('4', '1')
-            if 'decoder.' in name and '6' in name:
-                gan_layer = name.replace('decoder', 'G.module')
-                gan_layer = gan_layer.replace('6', '3')
-            if 'decoder.' in name and '7' in name:
-                gan_layer = name.replace('decoder', 'G.module')
-                gan_layer = gan_layer.replace('7', '4')
-            if 'decoder.' in name and '9' in name:
-                gan_layer = name.replace('decoder', 'G.module')
-                gan_layer = gan_layer.replace('9', '6')
-            if 'decoder.' in name and '10' in name:
-                gan_layer = name.replace('decoder', 'G.module')
-                gan_layer = gan_layer.replace('10', '7')
-            if 'decoder.' in name and '12' in name:
-                gan_layer = name.replace('decoder', 'G.module')
-                gan_layer = gan_layer.replace('12', '9')
-            if gan_layer:
-                model[gan_layer] = vae_init[name]
-                masks[gan_layer] = vae_trained[name].abs().gt(0).int()
-                pruned = masks[gan_layer].numel() - masks[gan_layer].nonzero().size(0)
-                tot = masks[gan_layer].numel()
-                frac = pruned / tot
-                self.log(f"{gan_layer} : {pruned} / {tot}  {frac}")
-                zeros += pruned
-                total += tot
-        self.load_state_dict(model)
-        self.log(f"Fraction of weights pruned = {zeros}/{total} = {zeros/total}")
-        self.masks = masks       
-        
-        
-    def one_shot_prune(self, pruning_perc, prune_gen = True, prune_disc = True, layer_wise = False, trained_original_model_state = None):
-        self.log(f"************pruning {pruning_perc} of the network****************")
-        self.log(f"Layer-wise pruning = {layer_wise}")
-        model_state = None
-        if trained_original_model_state:
-            model_state = torch.load(trained_original_model_state)
-            
-        if pruning_perc > 0:
-            masks = {}
-            zeros = 0
-            total = 0
-            flat_model_weights = np.array([])
-            for name in model_state:
-                if ("G" in name and "0" not in name and prune_gen) or ("D" in name and "9" not in name and prune_disc):
-                    layer_weights = model_state[name].data.cpu().numpy()
-                    flat_model_weights = np.concatenate((flat_model_weights, layer_weights.flatten()))
-            global_threshold = np.percentile(abs(flat_model_weights), pruning_perc)
-
-            self.log("VAE layer-wise pruning percentages")
-            for name in model_state:
-                if ("G" in name and "0" not in name and prune_gen) or ("D" in name and "9" not in name and prune_disc):
-                    threshold = global_threshold
-                    if layer_wise:
-                        layer_weights = model_state[name].data.cpu().numpy()
-                        threshold = np.percentile(abs(layer_weights), pruning_perc)
-                    masks[name] = model_state[name].abs().gt(threshold).int()
-                    pruned = masks[name].numel() - masks[name].nonzero().size(0)
-                    tot = masks[name].numel()
-                    frac = pruned / tot
-                    self.log(f"{name} : {pruned} / {tot}  {frac}")
-                    zeros += pruned
-                    total += tot
-            self.log(f"Fraction of weights pruned = {zeros}/{total} = {zeros/total}")
-            self.masks = masks
     
     def get_percent(self, total, percent):
         return (percent/100)*total
@@ -255,67 +231,36 @@ class GAN(nn.Module):
 
         return weight_fractions
     
-    def iterative_prune(self, init_state, 
-                        trained_original_model_state, 
+    def iterative_prune(self, 
                         number_of_iterations, 
-                        percent = 20, 
-                        init_with_old = True,
-                        prune_gen = True,
-                        prune_disc = True):
-        
-        
+                        percent = 20):
         weight_fractions = self.get_weight_fractions(number_of_iterations, percent)       
         self.log("***************Iterative Pruning started. Number of iterations: {} *****************".format(number_of_iterations))
         for pruning_iter in range(0, number_of_iterations):
             self.log("Running pruning iteration {}".format(pruning_iter))
             self.__init__(hidden_size = hidden_size, latent_size = latent_size)
             self = self.to(device)
-            trained_model = trained_original_model_state
-            if pruning_iter != 0:
-                trained_model = path + "/"+ "end_of_" + str(pruning_iter - 1) + '.pth'
             
-            self.one_shot_prune(weight_fractions[pruning_iter], 
-                                trained_original_model_state = trained_model, 
-                                prune_gen = prune_gen,
-                                prune_disc = prune_disc)
-            self.train(prune = True, 
-                       init_state = init_state, 
-                       init_with_old = init_with_old,
-                       prune_gen = prune_gen,
-                       prune_disc = prune_disc)
+            self.train(pruning_perc = weight_fractions[pruning_iter]/100)
             
             torch.save(self.state_dict(), path + "/"+ "end_of_" + str(pruning_iter) + '.pth')
             
             fake_images = self.G(test_z)
-            #fake_images = fake_images.view(fake_images.size(0), 1, 28, 28)
-            #save_image(self.denorm(fake_images), path + '/image_' + str(pruning_iter) + '.png')
             save_image(fake_images * 0.5 + 0.5, path + '/image_' + str(pruning_iter) + '.png')
             
             torch.cuda.empty_cache()
             
         self.log("Finished Iterative Pruning")
         
-        
-    def mask(self, prune_gen = True, prune_disc = True):
-        state = self.state_dict()
-        for name in state:
-            if (("G" in name and "0" not in name and prune_gen) or ("D" in name and "9" not in name and prune_disc)) and name in self.masks:
-                state[name].data.mul_(self.masks[name])
-        self.load_state_dict(state)
-    
-    def denorm(self, x):
-            out = (x + 1) / 2
-            return out.clamp(0, 1)
-
-    def train(self, prune, init_state = None, init_with_old = True, prune_gen = True, prune_disc = True):
+    def train(self, pruning_perc):
         self.log(f"Number of parameters in model {sum(p.numel() for p in self.parameters())}")
-        if not prune:
-            self.save(path + '/before_train.pth')
         
-        if prune and init_with_old:
-            self.load(init_state, 
-                      prune_gen = prune_gen,
-                      prune_disc = prune_disc)
+        self.log(f'original model param: {print_model_param_nums(self)}')
+        self.log(f'original model flops: {print_model_param_flops(self, image_size, True)}')
+        
+        
+        eb = EarlyBird(pruning_perc, epoch_keep = 2)
+        found_eb = False
         
         d_losses = np.zeros(num_epochs)
         g_losses = np.zeros(num_epochs)
@@ -325,11 +270,18 @@ class GAN(nn.Module):
         total_step = len(dataloader)
         
         for epoch in range(num_epochs):
+            if not found_eb and eb.early_bird_emerge(self):
+                found_eb = True
+                print("FOUND EARLY BIRD TICKET, Pruning model to ", pruning_perc)
+                self = one_shot_prune(self, pruning_perc)
+
+                self.log(f'pruned model param: {print_model_param_nums(self)}')
+                self.log(f'pruned model flops: {print_model_param_flops(self, image_size, True)}')
+
             for i, (images, _) in enumerate(dataloader):
-                #images = images.cuda()
+                    
                 mini_batch = images.size()[0]
                 images = images.to(device)
-                #images = images.view(mini_batch, -1).cuda()
                 # Create the labels which are later used as input for the BCE loss
                 real_labels = torch.ones(mini_batch).to(device)
                 fake_labels = torch.zeros(mini_batch).to(device)
@@ -358,10 +310,6 @@ class GAN(nn.Module):
                 d_loss.backward()
                 self.d_optimizer.step()
                 
-                if prune:
-                    self.mask(prune_gen = prune_gen,
-                              prune_disc = prune_disc)
-
                 # ================================================================== #
                 #                        Train the generator                         #
                 # ================================================================== #
@@ -379,11 +327,7 @@ class GAN(nn.Module):
                 self.reset_grad()
                 g_loss.backward()
                 self.g_optimizer.step()
-                
-                if prune:
-                    self.mask(prune_gen = prune_gen,
-                              prune_disc = prune_disc)
-                    
+                   
                 d_losses[epoch] = d_losses[epoch]*(i/(i+1.)) + d_loss.item()*(1./(i+1.))
                 g_losses[epoch] = g_losses[epoch]*(i/(i+1.)) + g_loss.item()*(1./(i+1.))
                 real_scores[epoch] = real_scores[epoch]*(i/(i+1.)) + real_score.mean().item()*(1./(i+1.))
@@ -396,15 +340,159 @@ class GAN(nn.Module):
             if epoch == num_epochs - 1:
                 #Save sampled images
                 self.compute_inception_fid()
-                #sample = self.G(test_z)
-                #sample = sample.view(sample.size(0), 3, 28, 28)
-                #save_image(self.denorm(sample), path + '/image_{}.png'.format(epoch+1))
-                #save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(epoch+1))
+                sample = self.G(test_z)
+                save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(pruning_perc))
                 
                 
         # Save the model checkpoints 
         torch.save(self.state_dict(), path + '/gan.pth')
 
+        
+def one_shot_prune(model, pruning_perc):
+    
+    for name, param in model.named_parameters():
+        print(name, param.data.numel())
+    
+    
+    model.log(f"************pruning {pruning_perc} of the network****************")
+
+    total = 0
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            total += m.weight.data.shape[0]
+
+    bn = torch.zeros(total)
+    index = 0
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            size = m.weight.data.shape[0]
+            bn[index:(index+size)] = m.weight.data.abs().clone()
+            index += size
+
+    p_flops = 0
+    y, i = torch.sort(bn)
+    # comparsion and permutation (sort process)
+    p_flops += total * np.log2(total) * 3
+    thre_index = int(total * pruning_perc)
+    thre = y[thre_index]
+
+    pruned = 0
+    cfg = []
+    cfg_mask = []
+    for k, m in enumerate(model.modules()):
+        if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
+            weight_copy = m.weight.data.abs().clone()
+            mask = weight_copy.gt(thre.cuda()).float().cuda()
+            pruned = pruned + mask.shape[0] - torch.sum(mask)
+            m.weight.data.mul_(mask)
+            m.bias.data.mul_(mask)
+            if int(torch.sum(mask)) > 0:
+                cfg.append(int(torch.sum(mask)))
+            cfg_mask.append(mask.clone())
+            print('layer index: {:d} \t total channel: {:d} \t remaining channel: {:d}'.
+                format(k, mask.shape[0], int(torch.sum(mask))))
+        elif isinstance(m, nn.MaxPool2d):
+            cfg.append('M')
+    print(cfg)
+    # apply mask flops
+    # p_flops += total
+
+    # compare two mask distance
+    p_flops += 2 * total #(minus and sum)
+
+    pruned_ratio = pruned/total
+    print("Pruned ratio: ", pruned_ratio)
+    print('  + Memory Request: %.2fKB' % float(total * 32 / 1024 / 8))
+    print('  + Flops for pruning: %.2fM' % (p_flops / 1e6))
+
+    newmodel = GAN(hidden_size = hidden_size, latent_size = latent_size)
+
+    layer_id_in_cfg = 0
+    start_mask = torch.ones(3)
+    end_mask = cfg_mask[layer_id_in_cfg]
+    for [m0, m1] in zip(model.modules(), newmodel.modules()):
+        print("Layer id ", layer_id_in_cfg)
+        if isinstance(m0, nn.BatchNorm2d):
+            print(end_mask)
+            if torch.sum(end_mask) == 0:
+                continue
+            idx1 = np.squeeze(np.argwhere(np.asarray(end_mask.cpu().numpy())))
+            if idx1.size == 1:
+                idx1 = np.resize(idx1,(1,))
+            m1.weight.data = m0.weight.data[idx1.tolist()].clone()
+            m1.bias.data = m0.bias.data[idx1.tolist()].clone()
+            m1.running_mean = m0.running_mean[idx1.tolist()].clone()
+            m1.running_var = m0.running_var[idx1.tolist()].clone()
+            layer_id_in_cfg += 1
+            start_mask = end_mask.clone()
+            if layer_id_in_cfg < len(cfg_mask):
+                end_mask = cfg_mask[layer_id_in_cfg]
+        elif isinstance(m0, nn.Conv2d):
+            if torch.sum(end_mask) == 0:
+                continue
+            idx0 = np.squeeze(np.argwhere(np.asarray(start_mask.cpu().numpy())))
+            idx1 = np.squeeze(np.argwhere(np.asarray(end_mask.cpu().numpy())))
+            # random set for test
+            # new_end_mask = np.asarray(end_mask.cpu().numpy())
+            # new_end_mask = np.append(new_end_mask[int(len(new_end_mask)/2):], new_end_mask[:int(len(new_end_mask)/2)])
+            # idx1 = np.squeeze(np.argwhere(new_end_mask))
+
+            print('In shape: {:d}, Out shape {:d}.'.format(idx0.size, idx1.size))
+            if idx0.size == 1:
+                idx0 = np.resize(idx0, (1,))
+            if idx1.size == 1:
+                idx1 = np.resize(idx1, (1,))
+            w1 = None
+            if m1.weight.shape[0] == 1:
+                w1 = m0.weight.data[:, idx0.tolist(), :, :].clone()
+                m1.bias.data = m0.bias.data.clone()
+                layer_id_in_cfg -= 1
+            else:
+                w1 = m0.weight.data[:, idx0.tolist(), :, :].clone()
+                w1 = w1[idx1.tolist(), :, :, :].clone()
+                m1.bias.data = m0.bias.data[idx1.tolist()].clone()
+                
+            m1.weight.data = w1.clone()
+            
+        elif isinstance(m0, nn.ConvTranspose2d):
+            if torch.sum(end_mask) == 0:
+                continue
+            idx0 = np.squeeze(np.argwhere(np.asarray(start_mask.cpu().numpy())))
+            idx1 = np.squeeze(np.argwhere(np.asarray(end_mask.cpu().numpy())))
+            # random set for test
+            # new_end_mask = np.asarray(end_mask.cpu().numpy())
+            # new_end_mask = np.append(new_end_mask[int(len(new_end_mask)/2):], new_end_mask[:int(len(new_end_mask)/2)])
+            # idx1 = np.squeeze(np.argwhere(new_end_mask))
+
+            print('In shape: {:d}, Out shape {:d}.'.format(idx0.size, idx1.size))
+            if idx0.size == 1:
+                idx0 = np.resize(idx0, (1,))
+            if idx1.size == 1:
+                idx1 = np.resize(idx1, (1,))
+            w1 = None
+            if m1.weight.shape[0] == latent_size:
+                w1 = m0.weight.data[:, idx1.tolist(), :, :].clone()
+                m1.bias.data = m0.bias.data[idx1.tolist()].clone()
+                layer_id_in_cfg += 1
+            elif m1.weight.shape[1] == 3:
+                w1 = m0.weight.data[idx0.tolist(), :, :, :].clone()
+                m1.bias.data = m0.bias.data.clone()
+            else:   
+                w1 = m0.weight.data[:, idx1.tolist(), :, :].clone()
+                m1.bias.data = m0.bias.data[idx1.tolist()].clone()
+                w1 = w1[idx0.tolist(), :, :, :].clone()   
+            
+            m1.weight.data = w1.clone()
+
+    #torch.save({'cfg': cfg, 'state_dict': newmodel.state_dict()}, os.path.join(args.save, 'pruned.pth.tar'))
+
+    model = newmodel
+    
+    for name, param in model.named_parameters():
+        print(name, param.data.numel())
+        
+    return model
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='PyTorch VAE')
 
@@ -505,10 +593,7 @@ if __name__ == "__main__":
 #         sample = model.G(test_z)
 #         save_image(sample * 0.5 + 0.5, path + '/image_{}.png'.format(i))
 
-    model.iterative_prune(init_state = init_state, 
-                        trained_original_model_state = trained_original_model_state, 
-                        number_of_iterations = 20, 
-                        percent = 20, 
-                        init_with_old = init_with_old,
-                        prune_gen = prune_gen,
-                        prune_disc = prune_disc)
+#     model.iterative_prune(number_of_iterations = 20, 
+#                         percent = 20)
+
+    model.train(0.2)
